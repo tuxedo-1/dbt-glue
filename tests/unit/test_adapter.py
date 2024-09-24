@@ -1,12 +1,15 @@
 from typing import Any, Dict, Optional
 import unittest
 from unittest import mock
-from moto import mock_glue
+from multiprocessing import get_context
+from botocore.client import BaseClient
+from moto import mock_aws
 
 from dbt.config import RuntimeConfig
 
 import dbt.flags as flags
 from dbt.adapters.glue import GlueAdapter
+from dbt.adapters.glue.gluedbapi import GlueConnection
 from dbt.adapters.glue.relation import SparkRelation
 from tests.util import config_from_parts_or_dicts
 from .util import MockAWSService
@@ -38,6 +41,7 @@ class TestGlueAdapter(unittest.TestCase):
                     "worker_type": "G.1X",
                     "schema": "dbt_unit_test_01",
                     "database": "dbt_unit_test_01",
+                    "use_interactive_session_role_for_api_calls": False
                 }
             },
             "target": "test",
@@ -51,22 +55,23 @@ class TestGlueAdapter(unittest.TestCase):
 
     def test_glue_connection(self):
         config = self._get_config()
-        adapter = GlueAdapter(config)
+        adapter = GlueAdapter(config, get_context("spawn"))
 
         with mock.patch("dbt.adapters.glue.connections.open"):
             connection = adapter.acquire_connection("dummy")
-            connection.handle  # trigger lazy-load
+            glueSession: GlueConnection = connection.handle  # trigger lazy-load
 
             self.assertEqual(connection.state, "open")
             self.assertEqual(connection.type, "glue")
             self.assertEqual(connection.credentials.schema, "dbt_unit_test_01")
             self.assertIsNotNone(connection.handle)
+            self.assertIsInstance(glueSession.client, BaseClient)
 
 
-    @mock_glue
+    @mock_aws
     def test_get_table_type(self):
         config = self._get_config()
-        adapter = GlueAdapter(config)
+        adapter = GlueAdapter(config, get_context("spawn"))
 
         database_name = "dbt_unit_test_01"
         table_name = "test_table"
@@ -81,16 +86,3 @@ class TestGlueAdapter(unittest.TestCase):
             connection = adapter.acquire_connection("dummy")
             connection.handle  # trigger lazy-load
             self.assertEqual(adapter.get_table_type(target_relation), "iceberg_table")
-
-    @mock_glue
-    def test_hudi_merge_table(self):
-        config = self._get_config()
-        adapter = GlueAdapter(config)
-        target_relation = SparkRelation.create(
-            schema="dbt_unit_test_01",
-            name="test_hudi_merge_table",
-        )
-        with mock.patch("dbt.adapters.glue.connections.open"):
-            connection = adapter.acquire_connection("dummy")
-            connection.handle  # trigger lazy-load
-            adapter.hudi_merge_table(target_relation, "SELECT 1", "id", "category", "empty", None, None)

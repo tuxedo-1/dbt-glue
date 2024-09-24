@@ -1,8 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
-from dbt.adapters.base import Credentials
-import dbt.exceptions
-
+from dbt.adapters.contracts.connection import Credentials
+from dbt_common.exceptions import DbtRuntimeError
 
 @dataclass
 class GlueCredentials(Credentials):
@@ -29,12 +28,13 @@ class GlueCredentials(Credentials):
     seed_mode: Optional[str] = "overwrite"
     default_arguments: Optional[str] = None
     iceberg_glue_commit_lock_table: Optional[str] = "myGlueLockTable"
-    use_interactive_session_role_for_api_calls: bool = True
+    use_interactive_session_role_for_api_calls: Optional[bool] = False
     lf_tags: Optional[str] = None
     glue_session_id: Optional[str] = None
     glue_session_reuse: Optional[bool] = False
     datalake_formats: Optional[str] = None
-    enable_session_per_model = False
+    enable_session_per_model: Optional[bool] = False
+    use_arrow: Optional[bool] = False
 
 
     @property
@@ -55,7 +55,7 @@ class GlueCredentials(Credentials):
     def __post_init__(self):
         # spark classifies database and schema as the same thing
         if self.database is not None and self.database != self.schema:
-            raise dbt.exceptions.DbtRuntimeError(
+            raise DbtRuntimeError(
                 f"    schema: {self.schema} \n"
                 f"    database: {self.database} \n"
                 f"On Spark, database must be omitted or have the same value as"
@@ -87,9 +87,11 @@ class GlueCredentials(Credentials):
             'seed_mode',
             'default_arguments',
             'iceberg_glue_commit_lock_table',
+            'use_interactive_session_role_for_api_calls',
             'lf_tags',
             'glue_session_id',
             'glue_session_reuse',
             'datalake_formats',
-            'enable_session_per_model'
+            'enable_session_per_model',
+            'use_arrow'
         ]
