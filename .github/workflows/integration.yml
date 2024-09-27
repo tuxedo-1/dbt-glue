@@ -126,14 +126,6 @@ jobs:
           repo="${GITHUB_REPOSITORY#${GITHUB_REPOSITORY_OWNER}/}"
           echo "name=${repo}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-session-name: ${{ steps.session.outputs.name }}
-          role-to-assume: arn:aws:iam::${{ secrets.DBT_AWS_ACCOUNT }}:role/dbt-glue
-          aws-region: ${{ secrets.DBT_GLUE_REGION }}
-          mask-aws-account-id: true
-
       - name: Run tox
         run: |
           export DBT_S3_LOCATION=${{ secrets.DBT_S3_LOCATION }}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${{ matrix.python-version }}
