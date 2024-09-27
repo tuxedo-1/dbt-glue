@@ -1,16 +1,17 @@
 import io
+import json
 import os
 import re
 import uuid
 import boto3
-from typing import Dict, List, Any
+from dbt.adapters.glue.util import get_columns_from_result, get_pandas_dataframe_from_result_file
+from typing import Set, Dict, List, Any, Iterable, FrozenSet, Tuple
 
-import dbt
 import agate
 from concurrent.futures import Future
 
 from dbt.adapters.base import available
-from dbt.adapters.base.relation import BaseRelation
+from dbt.adapters.base.relation import BaseRelation, InformationSchema
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.glue import GlueConnectionManager
 from dbt.adapters.glue.column import GlueColumn
@@ -22,10 +23,11 @@ from dbt.adapters.glue.lakeformation import (
     LfTagsConfig,
     LfTagsManager,
 )
-from dbt.exceptions import DbtDatabaseError
+from dbt.adapters.contracts.relation import RelationConfig
+from dbt_common.exceptions import DbtDatabaseError, CompilationError
 from dbt.adapters.base.impl import catch_as_completed
-from dbt.utils import executor
-from dbt.events import AdapterLogger
+from dbt_common.utils import executor
+from dbt.adapters.events.logging import AdapterLogger
 
 logger = AdapterLogger("Glue")
 
@@ -76,11 +78,16 @@ class GlueAdapter(SQLAdapter):
     def convert_datetime_type(cls, agate_table, col_idx):
         return "timestamp"
 
+    def use_arrow(self):
+        connection: GlueConnectionManager = self.connections.get_thread_connection()
+        glueSession: GlueConnection = connection.handle
+        return glueSession.credentials.use_arrow
+
     def get_connection(self):
         connection: GlueConnectionManager = self.connections.get_thread_connection()
         glueSession: GlueConnection = connection.handle
-        if glueSession.credentials.role_arn is not None:
-            if glueSession.credentials.use_interactive_session_role_for_api_calls is True:
+        if glueSession.credentials.role_arn:
+            if glueSession.credentials.use_interactive_session_role_for_api_calls:
                 sts_client = boto3.client('sts')
                 assumed_role_object = sts_client.assume_role(
                     RoleArn=glueSession.credentials.role_arn,
@@ -88,39 +95,38 @@ class GlueAdapter(SQLAdapter):
                 )
                 credentials = assumed_role_object['Credentials']
                 glue_client = boto3.client("glue", region_name=glueSession.credentials.region,
-                                    aws_access_key_id=credentials['AccessKeyId'],
-                                    aws_secret_access_key=credentials['SecretAccessKey'],
-                                    aws_session_token=credentials['SessionToken'])
+                                           aws_access_key_id=credentials['AccessKeyId'],
+                                           aws_secret_access_key=credentials['SecretAccessKey'],
+                                           aws_session_token=credentials['SessionToken'])
                 return glueSession, glue_client
 
         glue_client = boto3.client("glue", region_name=glueSession.credentials.region)
-
         return glueSession, glue_client
 
     def list_schemas(self, database: str) -> List[str]:
         session, client = self.get_connection()
-        responseGetDatabases = client.get_databases()
-        databaseList = responseGetDatabases['DatabaseList']
+        paginator = client.get_paginator('get_databases')
         schemas = []
-        for databaseDict in databaseList:
-            databaseName = databaseDict['Name']
-            schemas.append(databaseName)
+        for page in paginator.paginate():
+            databaseList = page['DatabaseList']
+            for databaseDict in databaseList:
+                databaseName = databaseDict['Name']
+                schemas.append(databaseName)
         return schemas
 
     def list_relations_without_caching(self, schema_relation: SparkRelation):
         session, client = self.get_connection()
         relations = []
+        paginator = client.get_paginator('get_tables')
         try:
-            response = client.get_tables(
-                DatabaseName=schema_relation.schema,
-            )
-            for table in response.get("TableList", []):
-                relations.append(self.Relation.create(
-                    database=schema_relation.schema,
-                    schema=schema_relation.schema,
-                    identifier=table.get("Name"),
-                    type=self.relation_type_map.get(table.get("TableType")),
-                ))
+            for page in paginator.paginate(DatabaseName=schema_relation.schema):
+                for table in page.get('TableList', []):
+                    relations.append(self.Relation.create(
+                        database=schema_relation.schema,
+                        schema=schema_relation.schema,
+                        identifier=table.get("Name"),
+                        type=self.relation_type_map.get(table.get("TableType")),
+                    ))
             return relations
         except Exception as e:
             logger.error(e)
@@ -182,11 +188,14 @@ class GlueAdapter(SQLAdapter):
                 DatabaseName=schema,
                 Name=identifier
             )
+            is_delta = response.get('Table').get("Parameters").get("spark.sql.sources.provider") == "delta"
+
             relations = self.Relation.create(
                 database=schema,
                 schema=schema,
                 identifier=identifier,
-                type=self.relation_type_map.get(response.get("Table", {}).get("TableType", "Table"))
+                type=self.relation_type_map.get(response.get("Table", {}).get("TableType", "Table")),
+                is_delta=is_delta
             )
             logger.debug(f"""schema : {schema}
                              identifier : {identifier}
@@ -199,12 +208,13 @@ class GlueAdapter(SQLAdapter):
             logger.error(e)
 
     def get_columns_in_relation(self, relation: BaseRelation):
+        logger.debug("get_columns_in_relation called")
         session, client = self.get_connection()
         # https://spark.apache.org/docs/3.0.0/sql-ref-syntax-aux-describe-table.html
         response = client.get_table(
-                DatabaseName=relation.schema,
-                Name=relation.name
-            )
+            DatabaseName=relation.schema,
+            Name=relation.name
+        )
         _specific_type = response.get("Table", {}).get('Parameters', {}).get('table_type', '')
 
         if _specific_type.lower() == 'iceberg':
@@ -234,12 +244,19 @@ class GlueAdapter(SQLAdapter):
         try:
             response = session.cursor().execute(code)
             records = self.fetch_all_response(response)
+            existing_columns = []
+            
 
             for record in records:
-                column = Column(column=record[0], dtype=record[1])
-                if record[0][:1] != "#":
-                    if column not in columns:
-                        columns.append(column)
+                column_name: str = record[0].strip()
+                column_type: str = record[1].strip()
+                if (
+                    column_name.lower() not in ["", "not partitioned"]
+                    and not column_name.startswith('#') and column_name not in existing_columns
+                ):
+                    column = self.Column(column=column_name, dtype=column_type)
+                    columns.append(column)
+                    existing_columns.append(column_name)
 
         except DbtDatabaseError as e:
             raise DbtDatabaseError(msg="GlueGetColumnsInRelationFailed") from e
@@ -252,32 +269,53 @@ class GlueAdapter(SQLAdapter):
         columns = [x for x in columns
                    if x.name not in self.HUDI_METADATA_COLUMNS]
 
+        # strip partition columns.
+        columns = [x for x in columns
+                   if not re.match(r'^Part \d+$', x.name)]
+
         logger.debug("columns after strip:")
         logger.debug(columns)
 
         return columns
 
     def fetch_all_response(self, response):
+        logger.debug("fetch_all_response called")
         records = []
-        obj_columns = [column.get("name") for column in response.get("description")]
-        for item in response.get("results", []):
+        use_arrow = self.use_arrow()
+
+        logger.debug(f"fetch_all_response use_arrow={use_arrow}")
+        if use_arrow:
+            result_bucket = response.get("result_bucket")
+            result_key = response.get("result_key")
+            pdf = get_pandas_dataframe_from_result_file(result_bucket, result_key)
+            results = pdf.to_dict('records')[0]
+            items = results.get("results", [])
+            columns = get_columns_from_result(results)
+        else:
+            items = response.get("results", [])
+            columns = [column.get("name") for column in response.get("description")]
+        logger.debug(f"fetch_all_response results: {columns}")
+        for item in items:
             record = []
-            for column in obj_columns:
+            for column in columns:
                 record.append(item.get("data", {}).get(column, None))
             records.append(record)
         return records
 
+    def quote(self, identifier: str) -> str:  # type: ignore
+        return "`{}`".format(identifier)
+
     def set_table_properties(self, table_properties):
-        if table_properties=='empty':
+        if table_properties == 'empty':
             return ""
         else:
             table_properties_formatted = []
-            for key in table_properties :
+            for key in table_properties:
                 table_properties_formatted.append("'" + key + "'='" + table_properties[key] + "'")
             if len(table_properties_formatted) > 0:
                 table_properties_csv = ','.join(table_properties_formatted)
                 return "TBLPROPERTIES (" + table_properties_csv + ")"
-            else :
+            else:
                 return ""
 
     def set_iceberg_merge_key(self, merge_key):
@@ -409,8 +447,12 @@ class GlueAdapter(SQLAdapter):
                 logger.error(e)
                 logger.error("create_schema exception")
 
-    def get_catalog(self, manifest):
-        schema_map = self._get_catalog_schemas(manifest)
+    def get_catalog(
+        self,
+        relation_configs: Iterable[RelationConfig],
+        used_schemas: FrozenSet[Tuple[str, str]],
+    ) -> Tuple[agate.Table, List[Exception]]:
+        schema_map = self._get_catalog_schemas(relation_configs)
 
         with executor(self.config) as tpe:
             futures: List[Future[agate.Table]] = []
@@ -419,7 +461,7 @@ class GlueAdapter(SQLAdapter):
                     continue
                 name = list(schemas)[0]
                 fut = tpe.submit_connected(
-                    self, name, self._get_one_catalog, info, [name], manifest
+                    self, name, self._get_one_catalog, info, [name], relation_configs
                 )
                 futures.append(fut)
 
@@ -427,10 +469,13 @@ class GlueAdapter(SQLAdapter):
         return catalogs, exceptions
 
     def _get_one_catalog(
-            self, information_schema, schemas, manifest,
+        self,
+        information_schema: InformationSchema,
+        schemas: Set[str],
+        used_schemas: FrozenSet[Tuple[str, str]],
     ) -> agate.Table:
         if len(schemas) != 1:
-            dbt.exceptions.raise_compiler_error(
+            raise CompilationError(
                 f'Expected only one schema in glue _get_one_catalog, found '
                 f'{schemas}'
             )
@@ -491,14 +536,14 @@ class GlueAdapter(SQLAdapter):
 
         code = f'''
 custom_glue_code_for_dbt_adapter
-csv = {f.getvalue()}
+csv = {json.loads(f.getvalue())}
 df = spark.createDataFrame(csv)
 table_name = '{model["schema"]}.{model["name"]}'
-if (spark.sql("show tables in {model["schema"]}").where("tableName == '{model["name"]}'").count() > 0):
+if (spark.sql("show tables in {model["schema"]}").where("tableName == lower('{model["name"]}')").count() > 0):
     df.write\
         .mode("{session.credentials.seed_mode}")\
         .format("{session.credentials.seed_format}")\
-        .insertInto(table_name, overwrite={mode})   
+        .insertInto(table_name, overwrite={mode})
 else:
     df.write\
         .option("path", "{session.credentials.location}/{model["schema"]}/{model["name"]}")\
@@ -566,7 +611,7 @@ SqlWrapper2.execute("""select * from {model["schema"]}.{model["name"]} limit 1""
 
         if {session.credentials.delta_athena_prefix} is not None:
             run_msck_repair = f'''
-            spark.sql("MSCK REPAIR TABLE {target_relation.schema}.headertoberepalced_{target_relation.name}") 
+            spark.sql("MSCK REPAIR TABLE {target_relation.schema}.headertoberepalced_{target_relation.name}")
             SqlWrapper2.execute("""select 1""")
             '''
             generate_symlink = f'''
@@ -574,21 +619,23 @@ SqlWrapper2.execute("""select * from {model["schema"]}.{model["name"]} limit 1""
             from delta.tables import DeltaTable
             deltaTable = DeltaTable.forPath(spark, "{location}")
             deltaTable.generate("symlink_format_manifest")
-            
+
             '''
             if partition_by is not None:
                 update_manifest_code = generate_symlink + run_msck_repair
             else:
                 update_manifest_code = generate_symlink + f'''SqlWrapper2.execute("""select 1""")'''
             try:
-                session.cursor().execute(re.sub("headertoberepalced", session.credentials.delta_athena_prefix, update_manifest_code))
+                session.cursor().execute(
+                    re.sub("headertoberepalced", session.credentials.delta_athena_prefix, update_manifest_code))
             except DbtDatabaseError as e:
                 raise DbtDatabaseError(msg="GlueDeltaUpdateManifestFailed") from e
             except Exception as e:
                 logger.error(e)
             self._update_additional_location(target_relation, location)
+
     @available
-    def delta_create_table(self, target_relation, request, primary_key, partition_key, custom_location):
+    def delta_create_table(self, target_relation, request, primary_key, partition_key, custom_location, delta_create_table_write_options=None):
         session, client = self.get_connection()
         logger.debug(request)
 
@@ -597,6 +644,11 @@ SqlWrapper2.execute("""select * from {model["schema"]}.{model["name"]} limit 1""
             location = f"{session.credentials.location}/{target_relation.schema}/{target_relation.name}"
         else:
             location = custom_location
+        
+        options_string = ""
+        if delta_create_table_write_options:
+            for key, value in delta_create_table_write_options.items():
+                options_string += f'.option("{key}", "{value}")'
 
         create_table_query = f"""
 CREATE TABLE {table_name}
@@ -608,7 +660,7 @@ LOCATION '{location}'
 custom_glue_code_for_dbt_adapter
 spark.sql("""
 {request}
-""").write.format("delta").mode("overwrite")'''
+""").write.format("delta").mode("overwrite"){options_string}'''
 
         write_data_footer = f'''.save("{location}")
 SqlWrapper2.execute("""select 1""")
@@ -621,7 +673,7 @@ deltaTable = DeltaTable.forPath(spark, "{location}")
 deltaTable.generate("symlink_format_manifest")
 schema = deltaTable.toDF().schema
 columns = (','.join([field.simpleString() for field in schema])).replace(':', ' ')
-ddl = """CREATE EXTERNAL TABLE {target_relation.schema}.headertoberepalced_{target_relation.name} (""" + columns + """) 
+ddl = """CREATE EXTERNAL TABLE {target_relation.schema}.headertoberepalced_{target_relation.name} (""" + columns + """)
 '''
 
         create_athena_table_footer = f'''
@@ -632,13 +684,13 @@ LOCATION '{location}/_symlink_format_manifest/'"""
 spark.sql(ddl)
 '''
         if partition_key is not None:
-            part_list = (', '.join(['`{}`'.format(field) for field in partition_key])).replace('`', '')
-            write_data_partition = f'''.partitionBy("{part_list}")'''
+            part_list = (', '.join(['`"{}"`'.format(field) for field in partition_key])).replace('`', '')
+            write_data_partition = f'''.partitionBy({part_list})'''
             create_athena_table_partition = f'''
 PARTITIONED BY ({part_list})
             '''
             run_msck_repair = f'''
-spark.sql("MSCK REPAIR TABLE {target_relation.schema}.headertoberepalced_{target_relation.name}") 
+spark.sql("MSCK REPAIR TABLE {target_relation.schema}.headertoberepalced_{target_relation.name}")
 SqlWrapper2.execute("""select 1""")
             '''
             write_data_code = write_data_header + write_data_partition + write_data_footer
@@ -646,8 +698,6 @@ SqlWrapper2.execute("""select 1""")
         else:
             write_data_code = write_data_header + write_data_footer
             create_athena_table = create_athena_table_header + create_athena_table_footer + f'''SqlWrapper2.execute("""select 1""")'''
-
-
 
         try:
             session.cursor().execute(write_data_code)
@@ -665,7 +715,8 @@ SqlWrapper2.execute("""select 1""")
 
         if {session.credentials.delta_athena_prefix} is not None:
             try:
-                session.cursor().execute(re.sub("headertoberepalced", session.credentials.delta_athena_prefix, create_athena_table))
+                session.cursor().execute(
+                    re.sub("headertoberepalced", session.credentials.delta_athena_prefix, create_athena_table))
             except DbtDatabaseError as e:
                 raise DbtDatabaseError(msg="GlueDeltaCreateTableFailed") from e
             except Exception as e:
@@ -702,7 +753,8 @@ SqlWrapper2.execute("""select 1""")
             return f'''outputDf.write.format('org.apache.hudi').options(**combinedConf).mode('{write_mode}').save("{custom_location}/")'''
 
     @available
-    def hudi_merge_table(self, target_relation, request, primary_key, partition_key, custom_location, hudi_config, substitute_variables):
+    def hudi_merge_table(self, target_relation, request, primary_key, partition_key, custom_location, hudi_config,
+                         substitute_variables):
         session, client = self.get_connection()
         isTableExists = False
         if self.check_relation_exists(target_relation):
@@ -715,8 +767,8 @@ SqlWrapper2.execute("""select 1""")
             hudi_config = {}
 
         base_config = {
-            'className' : 'org.apache.hudi',
-            'hoodie.datasource.hive_sync.use_jdbc':'false',
+            'className': 'org.apache.hudi',
+            'hoodie.datasource.hive_sync.use_jdbc': 'false',
             'hoodie.datasource.write.precombine.field': 'update_hudi_ts',
             'hoodie.datasource.write.recordkey.field': primary_key,
             'hoodie.table.name': target_relation.name,
@@ -750,7 +802,7 @@ SqlWrapper2.execute("""select 1""")
                 'hoodie.cleaner.policy': 'KEEP_LATEST_COMMITS',
                 'hoodie.cleaner.commits.retained': 10,
             }
-        else :
+        else:
             write_mode = 'Overwrite'
             write_operation_config = {
                 'hoodie.datasource.write.operation': 'bulk_insert',
@@ -809,7 +861,7 @@ SqlWrapper2.execute("""SELECT * FROM {target_relation.schema}.{target_relation.n
                         {table_properties}
                         AS SELECT * FROM tmp_{target_relation.name}
                 """
-        else :
+        else:
             query = f"""
                         CREATE OR REPLACE TABLE glue_catalog.{target_relation.schema}.{target_relation.name}
                         PARTITIONED BY {partition_by}
@@ -824,13 +876,12 @@ SqlWrapper2.execute("""SELECT * FROM {target_relation.schema}.{target_relation.n
                         INSERT INTO glue_catalog.{target_relation.schema}.{target_relation.name}
                         SELECT * FROM tmp_{target_relation.name}
                     """
-        else :
+        else:
             query = f"""
                         INSERT INTO glue_catalog.{target_relation.schema}.{target_relation.name}
                         SELECT * FROM tmp_{target_relation.name} ORDER BY {partition_by}
                     """
         return query
-
 
     def iceberg_create_table(self, target_relation, partition_by, location, table_properties):
         table_properties = self.set_table_properties(table_properties)
@@ -842,7 +893,7 @@ SqlWrapper2.execute("""SELECT * FROM {target_relation.schema}.{target_relation.n
                         {table_properties}
                         AS SELECT * FROM tmp_{target_relation.name}
                     """
-        else :
+        else:
             query = f"""
                         CREATE TABLE glue_catalog.{target_relation.schema}.{target_relation.name}
                         USING iceberg
@@ -853,9 +904,8 @@ SqlWrapper2.execute("""SELECT * FROM {target_relation.schema}.{target_relation.n
                     """
         return query
 
-
     def iceberg_upsert(self, target_relation, merge_key):
-    ## Perform merge operation on incremental input data with MERGE INTO. This section of the code uses Spark SQL to showcase the expressive SQL approach of Iceberg to perform a Merge operation
+        ## Perform merge operation on incremental input data with MERGE INTO. This section of the code uses Spark SQL to showcase the expressive SQL approach of Iceberg to perform a Merge operation
         query = f"""
         MERGE INTO glue_catalog.{target_relation.schema}.{target_relation.name} t
         USING (SELECT * FROM tmp_{target_relation.name}) s
@@ -866,10 +916,11 @@ SqlWrapper2.execute("""SELECT * FROM {target_relation.schema}.{target_relation.n
         return query
 
     @available
-    def iceberg_write(self, target_relation, request, primary_key, partition_key, custom_location, write_mode, table_properties):
+    def iceberg_write(self, target_relation, request, primary_key, partition_key, custom_location, write_mode,
+                      table_properties):
         session, client = self.get_connection()
         if partition_key is not None:
-            partition_key  = '(' + ','.join(partition_key) + ')'
+            partition_key = '(' + ','.join(partition_key) + ')'
         if custom_location == "empty":
             location = f"{session.credentials.location}/{target_relation.schema}/{target_relation.name}"
         else:
@@ -914,7 +965,7 @@ if outputDf.count() > 0:'''
         if isTableExists:
             if write_mode == "append":
                 core_code = f'''
-    spark.sql("""{self.iceberg_insert(target_relation=target_relation,partition_by=partition_key)}""") '''
+    spark.sql("""{self.iceberg_insert(target_relation=target_relation, partition_by=partition_key)}""") '''
             elif write_mode == 'insert_overwrite':
                 core_code = f'''
     spark.sql("""{self.iceberg_create_or_replace_table(target_relation=target_relation, partition_by=partition_key, table_properties=table_properties)}""") '''
@@ -927,7 +978,7 @@ if outputDf.count() > 0:'''
         footer_code = f'''
 spark.sql("""REFRESH TABLE glue_catalog.{target_relation.schema}.{target_relation.name}""")
 '''
-        if session.credentials.glue_version == "4.0": # Clean up the table used for the workaround
+        if session.credentials.glue_version == "4.0":  # Clean up the table used for the workaround
             footer_code += f'''spark.sql("DROP TABLE IF EXISTS tmp_{target_relation.name}")
 from awsglue.context import GlueContext
 GlueContext(spark.sparkContext).purge_s3_path("{session.credentials.location}/{target_relation.schema}/tmp_{target_relation.name}"'''
@@ -976,7 +1027,7 @@ SqlWrapper2.execute("""SELECT * FROM glue_catalog.{target_relation.schema}.{targ
             raise DbtDatabaseError(msg="GlueIcebergExpireSnapshotsFailed") from e
         except Exception as e:
             logger.error(e)
-    
+
     @available
     def add_lf_tags(self, relation: SparkRelation, lf_tags_config: Dict[str, Any]) -> None:
         config = LfTagsConfig(**lf_tags_config)
@@ -1005,7 +1056,7 @@ SqlWrapper2.execute("""SELECT * FROM glue_catalog.{target_relation.schema}.{targ
             lf_permissions = LfPermissions(account, relation, lf)  # type: ignore
             lf_permissions.process_filters(lf_config)
             lf_permissions.process_permissions(lf_config)
-    
+
     @available
     def execute_pyspark(self, codeblock):
         session, client = self.get_connection()
